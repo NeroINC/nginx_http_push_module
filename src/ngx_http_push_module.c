@@ -560,6 +560,8 @@ static ngx_int_t ngx_http_push_broadcast_locked(ngx_http_push_channel_t *channel
 		ngx_http_push_reserve_message_locked(channel, msg);
 	}
 	
+	char responded_to_subscribers = 0;
+
 	while((cur=(ngx_http_push_pid_queue_t *)ngx_queue_next(&cur->queue))!=sentinel) {
 		pid_t           worker_pid  = cur->pid;
 		ngx_int_t       worker_slot = cur->slot;
@@ -569,6 +571,7 @@ static ngx_int_t ngx_http_push_broadcast_locked(ngx_http_push_channel_t *channel
 		if(worker_pid == ngx_pid) {
 			//my subscribers
 			ngx_http_push_respond_to_subscribers(channel, subscriber_sentinel, msg, status_code, status_line);
+			responded_to_subscribers = 1; // just setting it always to 1 is probably cheaper than checking if it's 0 and then setting
 		}
 		else {
 			//some other worker's subscribers
@@ -579,7 +582,6 @@ static ngx_int_t ngx_http_push_broadcast_locked(ngx_http_push_channel_t *channel
 			else {
 				ngx_log_error(NGX_LOG_ERR, log, 0, "push module: error communicating with some other worker process");
 			}
-			
 		}
 		ngx_shmtx_lock(&shpool->mutex);
 		/*
@@ -594,6 +596,12 @@ static ngx_int_t ngx_http_push_broadcast_locked(ngx_http_push_channel_t *channel
 		cur->subscriber_sentinel = NULL; //think about it it terms of garbage collection. it'll make sense. sort of.
 		
 	}
+
+	if (0 == responded_to_subscribers) {
+		// otherwise ngx_http_push_respond_to_subscribers() probably already free()'d it
+		ngx_http_push_release_message_locked(channel, msg);
+	}
+
 	return received;
 }
 
@@ -842,6 +850,10 @@ static ngx_int_t ngx_http_push_respond_to_subscribers(ngx_http_push_channel_t *c
 	ngx_http_push_subscriber_t     *cur, *next;
 	ngx_int_t                       responded_subscribers=0;
 	if(sentinel==NULL) {
+		ngx_shmtx_lock(&shpool->mutex);
+		////message deletion
+		ngx_http_push_release_message_locked(channel, msg);
+		ngx_shmtx_unlock(&shpool->mutex);
 		return NGX_OK;
 	}
 	
