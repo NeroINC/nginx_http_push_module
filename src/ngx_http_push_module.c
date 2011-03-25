@@ -552,7 +552,10 @@ static ngx_int_t ngx_http_push_handle_subscriber_concurrency(ngx_http_request_t 
 			ngx_int_t rc = ngx_http_push_broadcast_status_locked(channel, NGX_HTTP_NOT_FOUND, &NGX_HTTP_PUSH_HTTP_STATUS_409, r->connection->log, ngx_http_push_shpool);
 			ngx_shmtx_unlock(&ngx_http_push_shpool->mutex);
 
-			return rc==NGX_OK ? NGX_OK : NGX_ERROR;
+			if (rc == NGX_ERROR) {
+				return rc;
+			}
+            return NGX_OK;
 		
 		case NGX_HTTP_PUSH_SUBSCRIBER_CONCURRENCY_FIRSTIN:
 			ngx_http_push_respond_status_only(r, NGX_HTTP_NOT_FOUND, &NGX_HTTP_PUSH_HTTP_STATUS_409);
@@ -574,7 +577,7 @@ static ngx_int_t ngx_http_push_broadcast_locked(ngx_http_push_channel_t *channel
 	if(msg!=NULL && received==NGX_HTTP_PUSH_MESSAGE_RECEIVED) {
 		ngx_http_push_reserve_message_locked(channel, msg);
 	}
-	
+
 	char responded_to_subscribers = 0;
 
 	while((cur=(ngx_http_push_pid_queue_t *)ngx_queue_next(&cur->queue))!=sentinel) {
