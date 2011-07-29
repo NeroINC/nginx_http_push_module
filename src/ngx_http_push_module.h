@@ -67,6 +67,27 @@ typedef struct {
     ngx_int_t                       ignore_queue_on_no_cache;
 } ngx_http_push_loc_conf_t;
 
+struct shared_output_chain_cleanup_master {
+	/* has the producer finished? */
+	char setup_finished;
+	/* how many consumers are still in-flight */
+	long listeners;
+	
+	ngx_str_t *etag;
+	ngx_str_t *content_type;
+	ngx_buf_t *buffer;
+	ngx_chain_t *chain;
+};
+
+struct shared_output_chain_cleanup {
+	/* this data struct will be added to the client req.
+	 * cleanup handler list and is allocated from the client req. pool
+	 * so it will be free'd when the client is done (because that pool is destroy()'ed
+	 * That's why we store only the pointer to the actual data structure here.
+	 */
+	struct shared_output_chain_cleanup_master *master;
+};
+
 //message queue
 typedef struct {
     ngx_queue_t                     queue; //this MUST be first.
@@ -173,6 +194,9 @@ static ngx_int_t ngx_http_push_subscriber_get_etag_int(ngx_http_request_t * r);
 static ngx_str_t * ngx_http_push_subscriber_get_etag(ngx_http_request_t * r);
 static void ngx_http_push_subscriber_cleanup(ngx_http_push_subscriber_cleanup_t *data);
 static ngx_int_t ngx_http_push_prepare_response_to_subscriber_request(ngx_http_request_t *r, ngx_chain_t *chain, ngx_str_t *content_type, ngx_str_t *etag, time_t last_modified);
+static void ngx_http_push_shared_chain_cleanup(struct shared_output_chain_cleanup *data);
+static void ngx_http_push_shared_chain_cleanup_master(struct shared_output_chain_cleanup_master *data);
+
 
 //publisher
 static ngx_int_t ngx_http_push_publisher_handler(ngx_http_request_t * r);

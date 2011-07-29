@@ -266,18 +266,18 @@ static ngx_str_t * ngx_http_push_get_channel_id(ngx_http_request_t *r, ngx_http_
         etag->len = ngx_sprintf(etag->data,"%ui", message_tag)- etag->data;          \
     }
 
-#define NGX_HTTP_PUSH_MAKE_CONTENT_TYPE(content_type, content_type_len, msg, pool)   \
-    size_t ctype_size = sizeof(*content_type)+content_type_len;                      \
+#define NGX_HTTP_PUSH_MAKE_CONTENT_TYPE(ctype, content_type_len, msg, pool)          \
+    size_t ctype_size = sizeof(*ctype)+(content_type_len);                           \
     if (NULL == pool) {                                                              \
-        content_type = ngx_alloc(ctype_size, ngx_cycle->log);                        \
+        ctype = ngx_alloc(ctype_size, ngx_cycle->log);                               \
     }                                                                                \
     else {                                                                           \
-        content_type = ngx_palloc(pool, ctype_size);                                 \
+        ctype = ngx_palloc(pool, ctype_size);                                        \
     }                                                                                \
-    if(content_type != NULL) {                                                       \
-        (content_type)->len=content_type_len;                                        \
-        (content_type)->data=(u_char *)((content_type)+1);                           \
-        ngx_memcpy(content_type->data, (msg)->content_type.data, content_type_len);  \
+    if(ctype != NULL) {                                                              \
+        (ctype)->len=(content_type_len);                                             \
+        (ctype)->data=(u_char *)((ctype)+1);                                         \
+        ngx_memcpy(ctype->data, (msg)->content_type.data, content_type_len);         \
     }
 
 #define NGX_HTTP_PUSH_OPTIONS_OK_MESSAGE "Go ahead"
@@ -507,6 +507,7 @@ static ngx_int_t ngx_http_push_subscriber_handler(ngx_http_request_t *r) {
 				if((cln = ngx_pool_cleanup_add(r->pool, sizeof(ngx_pool_cleanup_file_t)))==NULL) {
 					return NGX_HTTP_INTERNAL_SERVER_ERROR;
 				}
+
 				cln->handler = ngx_pool_cleanup_file;
 				clnf = cln->data;
 				clnf->fd = chain->buf->file->fd;
@@ -658,6 +659,9 @@ static void ngx_http_push_publisher_body_handler(ngx_http_request_t * r) {
 		ngx_http_finalize_request(r, r->headers_out.status ? NGX_OK : NGX_HTTP_INTERNAL_SERVER_ERROR);
 		return;
 	}
+#ifdef DEBUG
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "push module: [publisher initial] r: %d req len: %d headers in content len: %d", r,  r->request_length, r->headers_in.content_length_n);
+#endif
 	
 	ngx_shmtx_lock(&shpool->mutex);
 	//POST requests will need a channel created if it doesn't yet exist.
@@ -709,12 +713,17 @@ static void ngx_http_push_publisher_body_handler(ngx_http_request_t * r) {
 				buf = ngx_create_temp_buf(r->pool, 0);
 				//this buffer will get copied to shared memory in a few lines, 
 				//so it does't matter what pool we make it in.
+			} 
+			else if(r->request_body->bufs->next!=NULL && r->request_body->bufs->next->buf!=NULL) {
+				/* sometimes the second buffer contains temporary file with the actual contents
+				 * I have no idea what the first buffer represents in that case. It seems to have
+				 * a small subset of the message in memory which is present in the temporary file anyway.
+				 * So that's why we check the second buffer before the first one.
+				 */
+				buf=r->request_body->bufs->next->buf;
 			}
 			else if(r->request_body->bufs->buf!=NULL) { //everything in the first buffer, please
 				buf=r->request_body->bufs->buf;
-			}
-			else if(r->request_body->bufs->next!=NULL) {
-				buf=r->request_body->bufs->next->buf;
 			}
 			else {
 				ngx_log_error(NGX_LOG_ERR, (r)->connection->log, 0, "push module: unexpected publisher message request body buffer location. please report this to the push module developers.");
@@ -863,107 +872,160 @@ static void ngx_http_push_publisher_body_handler(ngx_http_request_t * r) {
 	}
 }
 
+static struct shared_output_chain_cleanup_master *ngx_http_push_create_clndata_master(ngx_http_push_msg_t *msg, ngx_slab_pool_t *shpool) {
+	/* set up the cleanup handler */
+	struct shared_output_chain_cleanup_master *clndata_master;
+	
+	ngx_shmtx_lock(&shpool->mutex);
+	
+	clndata_master = ngx_alloc(sizeof *clndata_master, ngx_cycle->log);
+	clndata_master->etag = NULL;
+	clndata_master->content_type = NULL;
+	clndata_master->listeners = 0;
+	clndata_master->setup_finished = 0;
+	
+	// etag
+	NGX_HTTP_PUSH_MAKE_ETAG(msg->message_tag, clndata_master->etag, ngx_pcalloc, NULL);
+	if(clndata_master->etag == NULL) {
+		//oh, nevermind...
+		ngx_shmtx_unlock(&shpool->mutex);
+		return NULL;
+	}
+	
+	if(msg->content_type.len > 0) {
+		NGX_HTTP_PUSH_MAKE_CONTENT_TYPE((clndata_master->content_type), (msg->content_type.len), msg, NULL);
+		if(clndata_master->content_type == NULL) {
+			ngx_shmtx_unlock(&shpool->mutex);
+			ngx_free(clndata_master->etag);
+			ngx_free(clndata_master);
+			ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "push module: unable to allocate memory for content-type header while responding to several subscriber request");
+			return NULL;
+		}
+	}
+	
+	if((clndata_master->chain = ngx_http_push_create_output_chain_locked(msg->buf, NULL, ngx_cycle->log, shpool))==NULL) {
+		ngx_shmtx_unlock(&shpool->mutex);
+		ngx_free(clndata_master->etag);
+		ngx_free(clndata_master->content_type);
+		ngx_free(clndata_master);
+		ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "push module: unable to create output chain while responding to several subscriber request");
+		return NULL;
+	}
+	
+	ngx_shmtx_unlock(&shpool->mutex);
+	
+	clndata_master->buffer = clndata_master->chain->buf;
+	
+	return clndata_master;
+}
+
 static ngx_int_t ngx_http_push_respond_to_subscribers(ngx_http_push_channel_t *channel, ngx_http_push_subscriber_t *sentinel, ngx_http_push_msg_t *msg, ngx_int_t status_code, const ngx_str_t *status_line) {
 	ngx_slab_pool_t                *shpool = ngx_http_push_shpool;
 	ngx_http_push_subscriber_t     *cur, *next;
 	ngx_int_t                       responded_subscribers=0;
-	if(sentinel==NULL) {
+	struct shared_output_chain_cleanup_master *clndata_master = NULL;
+	ngx_int_t retcode = NGX_OK;
+    
+	if(sentinel == NULL) {
+		// no subscribers, delete the message
 		ngx_shmtx_lock(&shpool->mutex);
-		////message deletion
 		ngx_http_push_release_message_locked(channel, msg);
 		ngx_shmtx_unlock(&shpool->mutex);
 		return NGX_OK;
 	}
 	
-	cur=(ngx_http_push_subscriber_t *)ngx_queue_head(&sentinel->queue);
-	if(msg!=NULL) {
-		//copy everything we need first
-		ngx_str_t                  *content_type=NULL;
-		ngx_str_t                  *etag=NULL;
-		time_t                      last_modified_time;
-		ngx_chain_t                *chain;
-		size_t                      content_type_len;
-		ngx_http_request_t         *r;
+	cur = (ngx_http_push_subscriber_t *)ngx_queue_head(&sentinel->queue);
+	if(msg != NULL) {
 		ngx_buf_t                  *buffer;
 		u_char                     *pos;
-		
-		ngx_shmtx_lock(&shpool->mutex);
-		
-		//etag
-		NGX_HTTP_PUSH_MAKE_ETAG(msg->message_tag, etag, ngx_pcalloc, NULL);
-		if(etag==NULL) {
-			//oh, nevermind...
-			ngx_shmtx_unlock(&shpool->mutex);
-			return NGX_ERROR;
+		ngx_http_request_t         *r;
+		time_t                      last_modified_time;
+
+		clndata_master = NULL;
+		last_modified_time = msg->message_time;
+
+		//now let's respond to some requests!
+
+		char is_shared_chain = 1;
+		if (msg->buf->file != NULL) {
+			is_shared_chain = 0;
 		}
-		
-		//content-type
-		content_type_len = msg->content_type.len;
-		if(content_type_len>0) {
-			NGX_HTTP_PUSH_MAKE_CONTENT_TYPE(content_type, content_type_len, msg, NULL);
-			if(content_type==NULL) {
-				ngx_shmtx_unlock(&shpool->mutex);
-				ngx_free(etag);
-				ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "push module: unable to allocate memory for content-type header while responding to several subscriber request");
+
+		while(cur != sentinel) {
+			/* we have more than 1 listener on a channel and we are using a
+			 * temporary file. Since the file structure can't be safely shared
+			 * we will make a copy of it 
+			 */
+
+			if (clndata_master == NULL || (clndata_master != NULL && !is_shared_chain)) {
+				clndata_master = ngx_http_push_create_clndata_master(msg, shpool);
+				if (clndata_master == NULL) {
+					ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "push module: unable to copy the chain");
+					retcode = NGX_ERROR;
+					goto END;
+				}
+			}
+			buffer = clndata_master->buffer;
+			pos = buffer->pos;
+
+			next = (ngx_http_push_subscriber_t *)ngx_queue_next(&cur->queue);
+			//in this block, nothing in shared memory should be dereferenced.
+			r = cur->request;
+			//cleanup oughtn't dequeue anything. or decrement the subscriber count, for that matter
+			cur->clndata->subscriber = NULL;
+			cur->clndata->channel = NULL;
+			
+			r->discard_body = 0; //hacky hacky!
+			
+			struct shared_output_chain_cleanup *clndata;
+			ngx_pool_cleanup_t             *cln;
+			
+			if ((cln = ngx_pool_cleanup_add(r->pool, sizeof(*clndata))) == NULL) { //make sure we can.
+				// XXX: leaking memory here?
+				ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "push module: unable to set up cleanup handler for the shared response chain");
 				return NGX_ERROR;
 			}
-		}
-		
-		//preallocate output chain. yes, same one for every waiting subscriber
-		if((chain = ngx_http_push_create_output_chain_locked(msg->buf, NULL, ngx_cycle->log, shpool))==NULL) {
-			ngx_shmtx_unlock(&shpool->mutex);
-			ngx_free(etag);
-			ngx_free(content_type);
-			ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "push module: unable to create output chain while responding to several subscriber request");
-			return NGX_ERROR;
-		}
-		
-		buffer = chain->buf;
-		pos = buffer->pos;
-		
-		last_modified_time = msg->message_time;
-		
-		ngx_shmtx_unlock(&shpool->mutex);
-		
-		//now let's respond to some requests!
-		while(cur!=sentinel) {
-			next=(ngx_http_push_subscriber_t *)ngx_queue_next(&cur->queue);
-			//in this block, nothing in shared memory should be dereferenced.
-			r=cur->request;
-			//cleanup oughtn't dequeue anything. or decrement the subscriber count, for that matter
-			cur->clndata->subscriber=NULL;
-			cur->clndata->channel=NULL;
 			
-			r->discard_body=0; //hacky hacky!
+			cln->handler = (ngx_pool_cleanup_pt) ngx_http_push_shared_chain_cleanup;
+			clndata = (struct shared_output_chain_cleanup *)cln->data;
+			clndata->master = clndata_master;
 			
-			ngx_http_finalize_request(r, ngx_http_push_prepare_response_to_subscriber_request(r, chain, content_type, etag, last_modified_time)); //BAM!
+			clndata_master->listeners++;
+			if (clndata_master->buffer->file) {
+			    ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "push module: respond with fd %d", clndata_master->buffer->file);
+			}
+
+			ngx_http_finalize_request(r, ngx_http_push_prepare_response_to_subscriber_request(r, clndata_master->chain, clndata_master->content_type, clndata_master->etag, last_modified_time)); //BAM!
+
 			responded_subscribers++;
 			
 			//done with this subscriber. free the sucker.
 			ngx_free(cur);
 			
-			//rewind the buffer, please
-			buffer->pos = pos;
-			buffer->last_buf=1;
+			// XXX: this seems rather dubious
+			// if it really does have any efect it's probably also
+			// prone to race condition, but since i'm not sure about it's meaning at things seem
+			// to work I will leave it alone for now
+			if (is_shared_chain != 0) {
+				//rewind the buffer, please
+				buffer->pos = pos;
+				buffer->last_buf = 1;
+			}
 			
-			cur=next;
+			cur = next;
 		}
-		
-		//free everything relevant
-		ngx_free(etag);
-		ngx_free(content_type);
-		if(buffer->file) {
-			ngx_close_file(buffer->file->fd);
+
+		ngx_shmtx_lock(&shpool->mutex);
+		if (is_shared_chain && clndata_master && clndata_master->listeners == 0) {
+			/* all the cleanup handlers managed to run before we got here so
+			 * we have to deallocate the resources ourselves
+			 * we do this only in the case when there was no file because otherwise
+			 * everyone gets their own chain and is forced to clean it up too
+			 */
+			clndata_master->setup_finished = 1;
+			ngx_http_push_shared_chain_cleanup_master(clndata_master);
 		}
-		ngx_free(buffer);
-		ngx_free(chain);
-		
-		if(responded_subscribers) {
-			ngx_shmtx_lock(&shpool->mutex);
-			//message deletion
-			ngx_http_push_release_message_locked(channel, msg);
-			ngx_shmtx_unlock(&shpool->mutex);
-		}
+		ngx_shmtx_unlock(&shpool->mutex);
 	}
 	else {
 		//headers only probably
@@ -972,7 +1034,7 @@ static ngx_int_t ngx_http_push_respond_to_subscribers(ngx_http_push_channel_t *c
 			next=(ngx_http_push_subscriber_t *)ngx_queue_next(&cur->queue);
 			r=cur->request;
 			
-			//cleanup oughtn't dequeue anything. or decrement the subscriber count, for that matter
+			// cleanup oughtn't dequeue anything. or decrement the subscriber count, for that matter
 			cur->clndata->subscriber=NULL;
 			cur->clndata->channel=NULL;
 			ngx_http_finalize_request(r, ngx_http_push_respond_status_only(r, status_code, status_line));
@@ -981,12 +1043,14 @@ static ngx_int_t ngx_http_push_respond_to_subscribers(ngx_http_push_channel_t *c
 			cur=next;
 		}
 	}
+
+END:
 	ngx_shmtx_lock(&shpool->mutex);
-	channel->subscribers-=responded_subscribers;
+	channel->subscribers -= responded_subscribers;
 	//is the message still needed?
 	ngx_shmtx_unlock(&shpool->mutex);
 	ngx_free(sentinel);
-	return NGX_OK;
+	return retcode;
 }
 
 static ngx_int_t ngx_http_push_publisher_handler(ngx_http_request_t * r) {
@@ -1178,7 +1242,7 @@ void *ngx_push_pcalloc(ngx_pool_t *pool, size_t size) {
 //if shpool is provided, it is assumed that shm it is locked
 static ngx_chain_t * ngx_http_push_create_output_chain_general(ngx_buf_t *buf, ngx_pool_t *pool, ngx_log_t *log, ngx_slab_pool_t *shpool) {
 	ngx_chain_t                    *out;
-	ngx_file_t                     *file;
+	ngx_file_t                     *file = NULL;
 	
 	if((out = ngx_push_pcalloc(pool, sizeof(*out)))==NULL) {
 		return NULL;
@@ -1193,20 +1257,23 @@ static ngx_chain_t * ngx_http_push_create_output_chain_general(ngx_buf_t *buf, n
 	if (buf->file!=NULL) {
 		file = buf_copy->file;
 		file->log=log;
+
 		if(file->fd==NGX_INVALID_FILE) {
 			if(shpool) {
 				ngx_shmtx_unlock(&shpool->mutex);
-				file->fd=ngx_open_file(file->name.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, NGX_FILE_OWNER_ACCESS);
+				file->fd = ngx_open_file(file->name.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, NGX_FILE_OWNER_ACCESS);
 				ngx_shmtx_lock(&shpool->mutex);
 			}
 			else {
-				file->fd=ngx_open_file(file->name.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, NGX_FILE_OWNER_ACCESS);
+				file->fd = ngx_open_file(file->name.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, NGX_FILE_OWNER_ACCESS);
 			}
+
 		}
 		if(file->fd==NGX_INVALID_FILE) {
 			return NULL;
 		}
 	}
+
 	buf_copy->last_buf = 1;
 	out->buf = buf_copy;
 	out->next = NULL;
@@ -1223,6 +1290,36 @@ static void ngx_http_push_subscriber_cleanup(ngx_http_push_subscriber_cleanup_t 
 		data->channel->subscribers--;
 		ngx_shmtx_unlock(&ngx_http_push_shpool->mutex);
 	}
+}
+
+static void ngx_http_push_shared_chain_cleanup(struct shared_output_chain_cleanup *data) {
+	/* called when we want to release resources for one listener that we have responded to
+	 * and the data structs that are used in responding are shared between multiple clients
+	 * might free all the resources if our responded subscriber was the last one
+	 */
+	ngx_shmtx_lock(&ngx_http_push_shpool->mutex);
+	data->master->listeners -= 1;
+	
+	if (data->master->buffer->file != NULL || (data->master->setup_finished == 1 && data->master->listeners == 0)) {
+		ngx_http_push_shared_chain_cleanup_master(data->master);
+	}
+	
+	ngx_shmtx_unlock(&ngx_http_push_shpool->mutex);
+}
+
+static void ngx_http_push_shared_chain_cleanup_master(struct shared_output_chain_cleanup_master *data) {
+	/* actually frees the response data structures
+	 */
+	ngx_free(data->etag);
+	ngx_free(data->content_type);
+
+	if(data->buffer->file != NULL && data->buffer->file->fd != NGX_INVALID_FILE) {
+		ngx_close_file(data->buffer->file->fd);
+	}
+
+	ngx_free(data->buffer);
+	ngx_free(data->chain);
+	ngx_free(data);
 }
 
 static ngx_int_t ngx_http_push_respond_status_only(ngx_http_request_t *r, ngx_int_t status_code, const ngx_str_t *statusline) {
@@ -1278,14 +1375,15 @@ static void ngx_http_push_copy_preallocated_buffer(ngx_buf_t *buf, ngx_buf_t *cb
 			ngx_memcpy(cbuf->pos, buf->pos, ngx_buf_size(buf));
 			cbuf->memory=ngx_buf_in_memory_only(buf) ? 1 : 0;
 		}
-		if (buf->file!=NULL) {
+
+		if (buf->file != NULL) {
 			cbuf->file = (ngx_file_t *) (cbuf+1) + ((buf->temporary || buf->memory) ? ngx_buf_size(buf) : 0);
-			cbuf->file->fd=NGX_INVALID_FILE;
-			cbuf->file->log=NULL;
-			cbuf->file->offset=buf->file->offset;
-			cbuf->file->sys_offset=buf->file->sys_offset;
-			cbuf->file->name.len=buf->file->name.len;
-			cbuf->file->name.data=(u_char *) (cbuf->file+1);
+			cbuf->file->fd = NGX_INVALID_FILE;
+			cbuf->file->log = NULL;
+			cbuf->file->offset = buf->file->offset;
+			cbuf->file->sys_offset = buf->file->sys_offset;
+			cbuf->file->name.len = buf->file->name.len;
+			cbuf->file->name.data = (u_char *) (cbuf->file+1);
 			ngx_memcpy(cbuf->file->name.data, buf->file->name.data, buf->file->name.len);
 		}
 	}
