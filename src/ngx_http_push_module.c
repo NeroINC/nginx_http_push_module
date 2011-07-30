@@ -991,9 +991,6 @@ static ngx_int_t ngx_http_push_respond_to_subscribers(ngx_http_push_channel_t *c
 			clndata->master = clndata_master;
 			
 			clndata_master->listeners++;
-			if (clndata_master->buffer->file) {
-			    ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "push module: respond with fd %d", clndata_master->buffer->file);
-			}
 
 			ngx_http_finalize_request(r, ngx_http_push_prepare_response_to_subscriber_request(r, clndata_master->chain, clndata_master->content_type, clndata_master->etag, last_modified_time)); //BAM!
 
