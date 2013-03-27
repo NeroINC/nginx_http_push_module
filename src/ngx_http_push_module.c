@@ -1016,9 +1016,39 @@ static ngx_table_elt_t * ngx_http_push_add_response_header(ngx_http_request_t *r
 static ngx_int_t ngx_http_push_subscriber_get_etag_int(ngx_http_request_t * r) {
 	ngx_str_t                      *if_none_match = ngx_http_push_subscriber_get_etag(r);
 	ngx_int_t                       tag;
-	if(if_none_match==NULL || (if_none_match!=NULL && (tag = ngx_atoi(if_none_match->data, if_none_match->len))==NGX_ERROR)) {
-		tag=0;
+
+	if( if_none_match == NULL || if_none_match->len == 0 ) {
+		return 0;
 	}
+
+	u_char* copy_start 	= if_none_match->data;
+	size_t copy_size 	= if_none_match->len;
+
+	// Make sure we remove quotes given that the HTTP protocol defines the value with quotes.
+	if(if_none_match->data[0] == '"' && if_none_match->data[if_none_match->len - 1] == '"') {
+		copy_start += 1;
+		copy_size -= 2;
+	}
+
+	u_char* header_val = ngx_alloc(copy_size, r->connection->log);
+
+	if( header_val == NULL ) {
+		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "push module: unable to allocate memory while parsing If-None-Match header.");
+		return NGX_ERROR;
+	}
+
+	ngx_memcpy(header_val, copy_start, copy_size);
+
+	header_val[copy_size] = '\0';
+
+	tag = ngx_atoi(header_val, copy_size);
+
+	if( tag == NGX_ERROR ) {
+		tag = 0;
+	}
+
+	free(header_val);
+
 	return ngx_abs(tag);
 }
 
