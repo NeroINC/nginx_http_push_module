@@ -146,6 +146,9 @@ static ngx_http_push_msg_t * ngx_http_push_find_message_locked(ngx_http_push_cha
 		return NULL;
 	}
 
+//DEBUG
+tag = ngx_http_push_subscriber_get_etag_int(r);
+	
 	// do we want a future message?
 	msg = ngx_queue_data(sentinel->prev, ngx_http_push_msg_t, queue); 
 	if(time <= msg->message_time) { //that's an empty check (Sentinel's values are zero)
