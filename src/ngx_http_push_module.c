@@ -429,7 +429,8 @@ static ngx_int_t ngx_http_push_subscriber_handler(ngx_http_request_t *r) {
 					ngx_shmtx_unlock(&shpool->mutex);
 					
 					ngx_queue_insert_tail(&subscriber_sentinel->queue, &subscriber->queue);
-					
+
+					ngx_memzero(&subscriber->event, sizeof(subscriber->event));
 					if (cf->subscriber_timeout > 0) {		
 						subscriber->event.handler = ngx_http_push_clean_timeouted_subscribter;	
 						subscriber->event.data = subscriber;
