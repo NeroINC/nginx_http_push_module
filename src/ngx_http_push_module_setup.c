@@ -4,10 +4,6 @@ static ngx_int_t ngx_http_push_init_module(ngx_cycle_t *cycle) {
 	ngx_core_conf_t                *ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
 	ngx_http_push_worker_processes = ccf->worker_processes;
 	//initialize subscriber queues
-	//pool, please
-	if((ngx_http_push_pool = ngx_create_pool(NGX_CYCLE_POOL_SIZE, cycle->log))==NULL) { //I trust the cycle pool size to be a well-tuned one.
-		return NGX_ERROR; 
-	}
 	
 	//initialize our little IPC
 	return ngx_http_push_init_ipc(cycle, ngx_http_push_worker_processes);
@@ -100,11 +96,13 @@ static void *		ngx_http_push_create_loc_conf(ngx_conf_t *cf) {
 	lcf->min_messages=NGX_CONF_UNSET;
 	lcf->subscriber_concurrency=NGX_CONF_UNSET;
 	lcf->subscriber_poll_mechanism=NGX_CONF_UNSET;
+	lcf->subscriber_timeout=NGX_CONF_UNSET;
 	lcf->authorize_channel=NGX_CONF_UNSET;
 	lcf->store_messages=NGX_CONF_UNSET;
 	lcf->delete_oldest_received_message=NGX_CONF_UNSET;
 	lcf->max_channel_id_length=NGX_CONF_UNSET;
 	lcf->max_channel_subscribers=NGX_CONF_UNSET;
+    lcf->ignore_queue_on_no_cache=NGX_CONF_UNSET;
 	lcf->channel_group.data=NULL;
 	return lcf;
 }
@@ -116,11 +114,13 @@ static char *	ngx_http_push_merge_loc_conf(ngx_conf_t *cf, void *parent, void *c
 	ngx_conf_merge_value(conf->min_messages, prev->min_messages, NGX_HTTP_PUSH_DEFAULT_MIN_MESSAGES);
 	ngx_conf_merge_value(conf->subscriber_concurrency, prev->subscriber_concurrency, NGX_HTTP_PUSH_SUBSCRIBER_CONCURRENCY_BROADCAST);
 	ngx_conf_merge_value(conf->subscriber_poll_mechanism, prev->subscriber_poll_mechanism, NGX_HTTP_PUSH_MECHANISM_LONGPOLL);
+	ngx_conf_merge_sec_value(conf->subscriber_timeout, prev->subscriber_timeout, NGX_HTTP_PUSH_DEFAULT_SUBSCRIBER_TIMEOUT);
 	ngx_conf_merge_value(conf->authorize_channel, prev->authorize_channel, 0);
 	ngx_conf_merge_value(conf->store_messages, prev->store_messages, 1);
 	ngx_conf_merge_value(conf->delete_oldest_received_message, prev->delete_oldest_received_message, 0);
 	ngx_conf_merge_value(conf->max_channel_id_length, prev->max_channel_id_length, NGX_HTTP_PUSH_MAX_CHANNEL_ID_LENGTH);
 	ngx_conf_merge_value(conf->max_channel_subscribers, prev->max_channel_subscribers, 0);
+	ngx_conf_merge_value(conf->ignore_queue_on_no_cache, prev->ignore_queue_on_no_cache, 0);
 	ngx_conf_merge_str_value(conf->channel_group, prev->channel_group, "");
 	
 	//sanity checks
@@ -317,6 +317,13 @@ static ngx_command_t  ngx_http_push_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_push_loc_conf_t, subscriber_concurrency),
       NULL },
+	
+    { ngx_string("push_subscriber_timeout"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_push_loc_conf_t, subscriber_timeout),
+      NULL },
 	  
 	{ ngx_string("push_authorized_channels_only"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
@@ -352,7 +359,13 @@ static ngx_command_t  ngx_http_push_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_push_loc_conf_t, max_channel_subscribers),
       NULL },
-    
+    { ngx_string("push_ignore_queue_on_no_cache"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_push_loc_conf_t, ignore_queue_on_no_cache),
+      NULL },
+
     ngx_null_command
 };
 

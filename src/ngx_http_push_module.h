@@ -5,6 +5,7 @@
 
 #define NGX_HTTP_PUSH_DEFAULT_SHM_SIZE 33554432 //32 megs
 #define NGX_HTTP_PUSH_DEFAULT_BUFFER_TIMEOUT 3600
+#define NGX_HTTP_PUSH_DEFAULT_SUBSCRIBER_TIMEOUT 0  //default: never timeout
 
 #define NGX_HTTP_PUSH_DEFAULT_MIN_MESSAGES 1
 #define NGX_HTTP_PUSH_DEFAULT_MAX_MESSAGES 10
@@ -56,13 +57,36 @@ typedef struct {
 	ngx_int_t                       max_messages;
 	ngx_int_t                       subscriber_concurrency;
 	ngx_int_t                       subscriber_poll_mechanism;
+	time_t                          subscriber_timeout;
 	ngx_int_t                       authorize_channel;
 	ngx_int_t                       store_messages;
 	ngx_int_t                       delete_oldest_received_message;
 	ngx_str_t                       channel_group;
 	ngx_int_t                       max_channel_id_length;
 	ngx_int_t                       max_channel_subscribers;
+    ngx_int_t                       ignore_queue_on_no_cache;
 } ngx_http_push_loc_conf_t;
+
+struct shared_output_chain_cleanup_master {
+	/* has the producer finished? */
+	char setup_finished;
+	/* how many consumers are still in-flight */
+	long listeners;
+	
+	ngx_str_t *etag;
+	ngx_str_t *content_type;
+	ngx_buf_t *buffer;
+	ngx_chain_t *chain;
+};
+
+struct shared_output_chain_cleanup {
+	/* this data struct will be added to the client req.
+	 * cleanup handler list and is allocated from the client req. pool
+	 * so it will be free'd when the client is done (because that pool is destroy()'ed
+	 * That's why we store only the pointer to the actual data structure here.
+	 */
+	struct shared_output_chain_cleanup_master *master;
+};
 
 //message queue
 typedef struct {
@@ -84,6 +108,7 @@ typedef struct {
     ngx_queue_t                     queue; //this MUST be first.
 	ngx_http_request_t             *request;
 	ngx_http_push_subscriber_cleanup_t *clndata; 
+	ngx_event_t                     event;
 } ngx_http_push_subscriber_t;
 
 typedef struct {
@@ -134,7 +159,6 @@ typedef struct {
 } ngx_http_push_shm_data_t;
 
 ngx_int_t           ngx_http_push_worker_processes;
-ngx_pool_t         *ngx_http_push_pool;
 ngx_slab_pool_t    *ngx_http_push_shpool;
 ngx_shm_zone_t     *ngx_http_push_shm_zone = NULL;
 
@@ -165,16 +189,21 @@ static ngx_int_t ngx_http_push_broadcast_locked(ngx_http_push_channel_t *channel
 #define ngx_http_push_broadcast_message_locked(channel, msg, log, shpool) ngx_http_push_broadcast_locked(channel, msg, 0, NULL, log, shpool)
 
 static ngx_int_t ngx_http_push_respond_to_subscribers(ngx_http_push_channel_t *channel, ngx_http_push_subscriber_t *sentinel, ngx_http_push_msg_t *msg, ngx_int_t status_code, const ngx_str_t *status_line);
+static ngx_int_t ngx_http_push_allow_caching(ngx_http_request_t * r);
 static ngx_int_t ngx_http_push_subscriber_get_etag_int(ngx_http_request_t * r);
 static ngx_str_t * ngx_http_push_subscriber_get_etag(ngx_http_request_t * r);
 static void ngx_http_push_subscriber_cleanup(ngx_http_push_subscriber_cleanup_t *data);
 static ngx_int_t ngx_http_push_prepare_response_to_subscriber_request(ngx_http_request_t *r, ngx_chain_t *chain, ngx_str_t *content_type, ngx_str_t *etag, time_t last_modified);
+static void ngx_http_push_shared_chain_cleanup(struct shared_output_chain_cleanup *data);
+static void ngx_http_push_shared_chain_cleanup_master(struct shared_output_chain_cleanup_master *data);
+
 
 //publisher
 static ngx_int_t ngx_http_push_publisher_handler(ngx_http_request_t * r);
 static void ngx_http_push_publisher_body_handler(ngx_http_request_t * r);
 
 //utilities
+void *ngx_push_pcalloc(ngx_pool_t *pool, size_t size);
 //general request handling
 static void ngx_http_push_copy_preallocated_buffer(ngx_buf_t *buf, ngx_buf_t *cbuf);
 static ngx_table_elt_t * ngx_http_push_add_response_header(ngx_http_request_t *r, const ngx_str_t *header_name, const ngx_str_t *header_value);
@@ -189,6 +218,9 @@ const  ngx_str_t NGX_HTTP_PUSH_HEADER_ETAG = ngx_string("Etag");
 const  ngx_str_t NGX_HTTP_PUSH_HEADER_IF_NONE_MATCH = ngx_string("If-None-Match");
 const  ngx_str_t NGX_HTTP_PUSH_HEADER_VARY = ngx_string("Vary");
 const  ngx_str_t NGX_HTTP_PUSH_HEADER_ALLOW = ngx_string("Allow");
+const  ngx_str_t NGX_HTTP_PUSH_HEADER_CACHE_CONTROL = ngx_string("Cache-Control");
+const  ngx_str_t NGX_HTTP_PUSH_HEADER_PRAGMA = ngx_string("Pragma");
+
 
 //header values
 const  ngx_str_t NGX_HTTP_PUSH_CACHE_CONTROL_VALUE = ngx_string("no-cache");
